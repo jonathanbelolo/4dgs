@@ -1,0 +1,7 @@
+torch>=2.0
+ptwt>=0.1.9
+numpy
+Pillow
+tqdm
+matplotlib
+lpips
