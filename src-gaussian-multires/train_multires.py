@@ -51,18 +51,18 @@ class StageConfig:
 
 
 STAGES = [
-    StageConfig(img_res=100, max_iters=30_000, max_gaussians=100_000,
-                densify_from=500, densify_until=15_000, sh_degree=1,
-                grad_threshold=0.0002, max_scale=0.05, init_points=10_000),
-    StageConfig(img_res=200, max_iters=30_000, max_gaussians=200_000,
-                densify_from=500, densify_until=15_000, sh_degree=2,
-                grad_threshold=0.0001, max_scale=0.03, init_points=20_000),
-    StageConfig(img_res=400, max_iters=30_000, max_gaussians=500_000,
-                densify_from=500, densify_until=15_000, sh_degree=3,
-                grad_threshold=0.00008, max_scale=0.02, init_points=50_000),
-    StageConfig(img_res=800, max_iters=30_000, max_gaussians=1_000_000,
-                densify_from=500, densify_until=15_000, sh_degree=3,
-                grad_threshold=0.00005, max_scale=0.01, init_points=100_000),
+    StageConfig(img_res=100, max_iters=50_000, max_gaussians=200_000,
+                densify_from=500, densify_until=30_000, sh_degree=3,
+                grad_threshold=0.00008, max_scale=0.1, init_points=10_000),
+    StageConfig(img_res=200, max_iters=40_000, max_gaussians=300_000,
+                densify_from=500, densify_until=25_000, sh_degree=3,
+                grad_threshold=0.00006, max_scale=0.05, init_points=20_000),
+    StageConfig(img_res=400, max_iters=40_000, max_gaussians=500_000,
+                densify_from=500, densify_until=25_000, sh_degree=3,
+                grad_threshold=0.00005, max_scale=0.03, init_points=50_000),
+    StageConfig(img_res=800, max_iters=40_000, max_gaussians=1_000_000,
+                densify_from=500, densify_until=25_000, sh_degree=3,
+                grad_threshold=0.00004, max_scale=0.02, init_points=100_000),
 ]
 
 
@@ -422,10 +422,13 @@ def train_stage(model: MultiResModel, images: Tensor, camtoworlds: Tensor,
         idx = torch.randint(0, N, (1,)).item()
         gt_image = images[idx]
 
+        # SH degree ramp: start at 0, increase every 1000 steps up to stage max
+        current_sh_degree = min(step // 1000, cfg.sh_degree)
+
         # Render all layers jointly
         rendered, alpha, info = render_multires(
             model, camtoworlds[idx], K[idx], W, H,
-            sh_degree=cfg.sh_degree, near=near, far=far,
+            sh_degree=current_sh_degree, near=near, far=far,
         )
 
         # Loss
@@ -640,7 +643,7 @@ if __name__ == "__main__":
                         help="Path to nerf_synthetic directory")
     parser.add_argument("--output_dir", type=str, default="output/multires_v1")
     parser.add_argument("--ssim_weight", type=float, default=0.2)
-    parser.add_argument("--opacity_reg", type=float, default=0.001)
+    parser.add_argument("--opacity_reg", type=float, default=0.0)
     parser.add_argument("--resume", type=str, default=None,
                         help="Path to checkpoint to resume from")
     parser.add_argument("--max_stages", type=int, default=None,
