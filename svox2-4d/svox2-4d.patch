@@ -1,0 +1,1094 @@
+diff --git a/svox2/csrc/include/render_util.cuh b/svox2/csrc/include/render_util.cuh
+index 3c27d60..c303d7b 100644
+--- a/svox2/csrc/include/render_util.cuh
++++ b/svox2/csrc/include/render_util.cuh
+@@ -317,17 +317,17 @@ __device__ __constant__ const float C3[] = {
+     -0.5900435899266435
+ };
+ 
+-// __device__ __constant__ const float C4[] = {
+-//     2.5033429417967046,
+-//     -1.7701307697799304,
+-//     0.9461746957575601,
+-//     -0.6690465435572892,
+-//     0.10578554691520431,
+-//     -0.6690465435572892,
+-//     0.47308734787878004,
+-//     -1.7701307697799304,
+-//     0.6258357354491761,
+-// };
++__device__ __constant__ const float C4[] = {
++    2.5033429417967046,
++    -1.7701307697799304,
++    0.9461746957575601,
++    -0.6690465435572892,
++    0.10578554691520431,
++    -0.6690465435572892,
++    0.47308734787878004,
++    -1.7701307697799304,
++    0.6258357354491761,
++};
+ 
+ __device__ __inline__ void calc_sh(
+     const int basis_dim,
+@@ -338,16 +338,26 @@ __device__ __inline__ void calc_sh(
+     const float xx = x * x, yy = y * y, zz = z * z;
+     const float xy = x * y, yz = y * z, xz = x * z;
+     switch (basis_dim) {
+-        // 16 not supported rn due to warp size
+-        // case 16:
+-        //     out[9] = C3[0] * y * (3 * xx - yy);
+-        //     out[10] = C3[1] * xy * z;
+-        //     out[11] = C3[2] * y * (4 * zz - xx - yy);
+-        //     out[12] = C3[3] * z * (2 * zz - 3 * xx - 3 * yy);
+-        //     out[13] = C3[4] * x * (4 * zz - xx - yy);
+-        //     out[14] = C3[5] * z * (xx - yy);
+-        //     out[15] = C3[6] * x * (xx - 3 * yy);
+-        //     [[fallthrough]];
++        case 25:
++            out[16] = C4[0] * xy * (xx - yy);
++            out[17] = C4[1] * yz * (3 * xx - yy);
++            out[18] = C4[2] * xy * (7 * zz - 1.f);
++            out[19] = C4[3] * yz * (7 * zz - 3.f);
++            out[20] = C4[4] * (zz * (35 * zz - 30.f) + 3.f);
++            out[21] = C4[5] * xz * (7 * zz - 3.f);
++            out[22] = C4[6] * (xx - yy) * (7 * zz - 1.f);
++            out[23] = C4[7] * xz * (xx - 3 * yy);
++            out[24] = C4[8] * (xx * (xx - 3 * yy) - yy * (3 * xx - yy));
++            [[fallthrough]];
++        case 16:
++            out[9] = C3[0] * y * (3 * xx - yy);
++            out[10] = C3[1] * xy * z;
++            out[11] = C3[2] * y * (4 * zz - xx - yy);
++            out[12] = C3[3] * z * (2 * zz - 3 * xx - 3 * yy);
++            out[13] = C3[4] * x * (4 * zz - xx - yy);
++            out[14] = C3[5] * z * (xx - yy);
++            out[15] = C3[6] * x * (xx - 3 * yy);
++            [[fallthrough]];
+         case 9:
+             out[4] = C2[0] * xy;
+             out[5] = C2[1] * yz;
+@@ -424,7 +434,7 @@ __device__ __inline__ void calc_sphfunc_backward(
+             p[j] -= static_cast<float>(l[j]);
+         }
+ 
+-        __syncwarp((1U << grid.sh_data_dim) - 1);
++        __syncwarp(grid.sh_data_dim >= 32 ? 0xFFFFFFFFU : (1U << grid.sh_data_dim) - 1);
+         if (lane_id < grid.basis_dim && output_saved[lane_id] > 0.f) {
+             trilerp_backward_one<float, int32_t>(grad_basis_data,
+                     grid.basis_reso,
+diff --git a/svox2/csrc/optim_kernel.cu b/svox2/csrc/optim_kernel.cu
+index ba7d735..34fc3d3 100644
+--- a/svox2/csrc/optim_kernel.cu
++++ b/svox2/csrc/optim_kernel.cu
+@@ -265,3 +265,145 @@ void sgd_step(
+ 
+     CUDA_CHECK_ERRORS;
+ }
++
++// =============================================
++// Mod 6: Anchor gradient regularization kernel
++// =============================================
++
++namespace {
++namespace device {
++
++__launch_bounds__(RMSPROP_STEP_CUDA_THREADS, MIN_BLOCKS_PER_SM)
++__global__ void anchor_grad_kernel(
++        float* __restrict__ data,
++        float* __restrict__ grad,
++        const float* __restrict__ anchor,
++        const bool* __restrict__ mask,
++        int64_t N, int64_t C,
++        float lambda_reg) {
++    CUDA_GET_THREAD_ID(tid, N * C);
++    int64_t voxel = tid / C;
++    if (!mask[voxel]) return;
++    grad[tid] += lambda_reg * (data[tid] - anchor[tid]);
++}
++
++// =============================================
++// Mod 5: Weighted RMSprop kernel (per-voxel LR)
++// =============================================
++
++__inline__ __device__ void rmsprop_weighted_once(
++        float* __restrict__ ptr_data,
++        float* __restrict__ ptr_rms,
++        float* __restrict__ ptr_grad,
++        const float beta, const float lr, const float epsilon,
++        float minval, float lr_weight) {
++    float rms = *ptr_rms;
++    rms = rms == 0.f ? _SQR(*ptr_grad) : lerp(_SQR(*ptr_grad), rms, beta);
++    *ptr_rms = rms;
++    float effective_lr = lr * lr_weight;
++    *ptr_data = fmaxf(*ptr_data - effective_lr * (*ptr_grad) / (sqrtf(rms) + epsilon), minval);
++    *ptr_grad = 0.f;
++}
++
++__launch_bounds__(RMSPROP_STEP_CUDA_THREADS, MIN_BLOCKS_PER_SM)
++__global__ void rmsprop_weighted_index_step_kernel(
++        torch::PackedTensorAccessor64<float, 2, torch::RestrictPtrTraits> all_data,
++        torch::PackedTensorAccessor64<float, 2, torch::RestrictPtrTraits> all_rms,
++        torch::PackedTensorAccessor64<float, 2, torch::RestrictPtrTraits> all_grad,
++        torch::PackedTensorAccessor32<int64_t, 1, torch::RestrictPtrTraits> indices,
++        const float* __restrict__ lr_weights,
++        float beta,
++        float lr,
++        float epsilon,
++        float minval,
++        float lr_last) {
++    CUDA_GET_THREAD_ID(tid, indices.size(0) * all_data.size(1));
++    int32_t idx_pos = tid / all_data.size(1);
++    int32_t i = indices[idx_pos];
++    int32_t chnl = tid % all_data.size(1);
++    size_t off = i * all_data.size(1) + chnl;
++    float w = lr_weights[i];
++    rmsprop_weighted_once(all_data.data() + off, all_rms.data() + off,
++                 all_grad.data() + off,
++                 beta,
++                 (chnl == all_data.size(1) - 1) ? lr_last : lr,
++                 epsilon,
++                 minval,
++                 w);
++}
++
++}  // namespace device
++}  // namespace
++
++// C++ wrapper for anchor gradient
++void anchor_grad_step(
++        torch::Tensor data,
++        torch::Tensor grad,
++        torch::Tensor anchor,
++        torch::Tensor mask,
++        float lambda_reg) {
++    DEVICE_GUARD(data);
++    CHECK_INPUT(data);
++    CHECK_INPUT(grad);
++    CHECK_INPUT(anchor);
++    CHECK_INPUT(mask);
++
++    if (lambda_reg == 0.f) return;
++
++    const int64_t N = data.size(0);
++    const int64_t C = data.size(1);
++    const size_t Q = N * C;
++    const int cuda_n_threads = RMSPROP_STEP_CUDA_THREADS;
++    const int blocks = CUDA_N_BLOCKS_NEEDED(Q, cuda_n_threads);
++
++    device::anchor_grad_kernel<<<blocks, cuda_n_threads>>>(
++            data.data_ptr<float>(),
++            grad.data_ptr<float>(),
++            anchor.data_ptr<float>(),
++            mask.data_ptr<bool>(),
++            N, C,
++            lambda_reg);
++    CUDA_CHECK_ERRORS;
++}
++
++// C++ wrapper for weighted RMSprop
++void rmsprop_weighted_step(
++        torch::Tensor data,
++        torch::Tensor rms,
++        torch::Tensor grad,
++        torch::Tensor indexer,
++        torch::Tensor lr_weights,
++        float beta,
++        float lr,
++        float epsilon,
++        float minval,
++        float lr_last) {
++
++    DEVICE_GUARD(data);
++    CHECK_INPUT(data);
++    CHECK_INPUT(rms);
++    CHECK_INPUT(grad);
++    CHECK_INPUT(indexer);
++    CHECK_INPUT(lr_weights);
++
++    if (lr_last < 0.f) lr_last = lr;
++
++    const int cuda_n_threads = RMSPROP_STEP_CUDA_THREADS;
++
++    if (indexer.size(0) == 0) return;
++
++    const size_t Q = indexer.size(0) * data.size(1);
++    const int blocks = CUDA_N_BLOCKS_NEEDED(Q, cuda_n_threads);
++    device::rmsprop_weighted_index_step_kernel<<<blocks, cuda_n_threads>>>(
++            data.packed_accessor64<float, 2, torch::RestrictPtrTraits>(),
++            rms.packed_accessor64<float, 2, torch::RestrictPtrTraits>(),
++            grad.packed_accessor64<float, 2, torch::RestrictPtrTraits>(),
++            indexer.packed_accessor32<int64_t, 1, torch::RestrictPtrTraits>(),
++            lr_weights.data_ptr<float>(),
++            beta,
++            lr,
++            epsilon,
++            minval,
++            lr_last);
++    CUDA_CHECK_ERRORS;
++}
+diff --git a/svox2/csrc/render_lerp_kernel_cuvol.cu b/svox2/csrc/render_lerp_kernel_cuvol.cu
+index 3a1d047..5201ee4 100644
+--- a/svox2/csrc/render_lerp_kernel_cuvol.cu
++++ b/svox2/csrc/render_lerp_kernel_cuvol.cu
+@@ -119,6 +119,104 @@ __device__ __inline__ void trace_ray_cuvol(
+     }
+ }
+ 
++
++__device__ __inline__ void trace_ray_cuvol_sequential(
++        const PackedSparseGridSpec& __restrict__ grid,
++        SingleRaySpec& __restrict__ ray,
++        const RenderOptions& __restrict__ opt,
++        uint32_t lane_id,
++        float* __restrict__ sphfunc_val,
++        float* __restrict__ out,
++        float* __restrict__ out_log_transmit) {
++    // Sequential color channel path for basis_dim > 10.
++    // All 32 warp threads stay alive; threads with lane_id >= basis_dim
++    // contribute 0 to the reduction.
++    const bool is_active = (lane_id < static_cast<uint32_t>(grid.basis_dim));
++
++    if (ray.tmin > ray.tmax) {
++        if (lane_id < 3)
++            out[lane_id] = (grid.background_nlayers == 0) ? opt.background_brightness : 0.f;
++        if (out_log_transmit != nullptr && lane_id == 0)
++            *out_log_transmit = 0.f;
++        return;
++    }
++
++    float t = ray.tmin;
++    float outv[3] = {0.f, 0.f, 0.f};
++    float log_transmit = 0.f;
++
++    while (t <= ray.tmax) {
++#pragma unroll 3
++        for (int j = 0; j < 3; ++j) {
++            ray.pos[j] = fmaf(t, ray.dir[j], ray.origin[j]);
++            ray.pos[j] = min(max(ray.pos[j], 0.f), grid.size[j] - 1.f);
++            ray.l[j] = min(static_cast<int32_t>(ray.pos[j]), grid.size[j] - 2);
++            ray.pos[j] -= static_cast<float>(ray.l[j]);
++        }
++
++        const float skip = compute_skip_dist(ray,
++                       grid.links, grid.stride_x,
++                       grid.size[2], 0);
++        if (skip >= opt.step_size) {
++            t += ceilf(skip / opt.step_size) * opt.step_size;
++            continue;
++        }
++        float sigma = trilerp_cuvol_one(
++                grid.links, grid.density_data,
++                grid.stride_x, grid.size[2],
++                1, ray.l, ray.pos, 0);
++        if (opt.last_sample_opaque && t + opt.step_size > ray.tmax) {
++            ray.world_step = 1e9;
++        }
++
++        if (sigma > opt.sigma_thresh) {
++            const float pcnt = ray.world_step * sigma;
++            const float weight = _EXP(log_transmit) * (1.f - _EXP(-pcnt));
++            log_transmit -= pcnt;
++
++            // Process each color channel sequentially
++            for (int color_ch = 0; color_ch < 3; ++color_ch) {
++                float contrib = 0.f;
++                if (is_active) {
++                    float lane_color = trilerp_cuvol_one(
++                        grid.links, grid.sh_data,
++                        grid.stride_x, grid.size[2],
++                        grid.sh_data_dim,
++                        ray.l, ray.pos,
++                        color_ch * grid.basis_dim + lane_id);
++                    contrib = lane_color * sphfunc_val[lane_id];
++                }
++                // Full warp reduce (all 32 threads; inactive contribute 0)
++                for (int offset = 16; offset > 0; offset >>= 1) {
++                    contrib += __shfl_down_sync(0xFFFFFFFF, contrib, offset);
++                }
++                if (lane_id == 0) {
++                    outv[color_ch] += weight * fmaxf(contrib + 0.5f, 0.f);
++                }
++            }
++
++            if (_EXP(log_transmit) < opt.stop_thresh) {
++                log_transmit = -1e3f;
++                break;
++            }
++        }
++        t += opt.step_size;
++    }
++
++    if (lane_id == 0) {
++        if (grid.background_nlayers == 0) {
++            float bg = _EXP(log_transmit) * opt.background_brightness;
++            outv[0] += bg; outv[1] += bg; outv[2] += bg;
++        }
++        out[0] = outv[0];
++        out[1] = outv[1];
++        out[2] = outv[2];
++        if (out_log_transmit != nullptr) {
++            *out_log_transmit = log_transmit;
++        }
++    }
++}
++
+ __device__ __inline__ void trace_ray_expected_term(
+         const PackedSparseGridSpec& __restrict__ grid,
+         SingleRaySpec& __restrict__ ray,
+@@ -606,6 +704,149 @@ __device__ __inline__ void render_background_backward(
+     }
+ }
+ 
++
++__device__ __inline__ void trace_ray_cuvol_backward_sequential(
++        const PackedSparseGridSpec& __restrict__ grid,
++        const float* __restrict__ grad_output,
++        const float* __restrict__ color_cache,
++        SingleRaySpec& __restrict__ ray,
++        const RenderOptions& __restrict__ opt,
++        uint32_t lane_id,
++        const float* __restrict__ sphfunc_val,
++        float* __restrict__ grad_sphfunc_val,
++        float log_transmit_in,
++        float beta_loss,
++        float sparsity_loss,
++        PackedGridOutputGrads& __restrict__ grads,
++        float* __restrict__ accum_out,
++        float* __restrict__ log_transmit_out
++        ) {
++    // Sequential color channel backward path for basis_dim > 10.
++    // All 32 warp threads stay alive; inactive threads contribute 0.
++    const bool is_active = (lane_id < static_cast<uint32_t>(grid.basis_dim));
++
++    float accum = fmaf(color_cache[0], grad_output[0],
++                      fmaf(color_cache[1], grad_output[1],
++                           color_cache[2] * grad_output[2]));
++
++    if (ray.tmin > ray.tmax) {
++        if (accum_out != nullptr && lane_id == 0) { *accum_out = accum; }
++        if (log_transmit_out != nullptr && lane_id == 0) { *log_transmit_out = 0.f; }
++        return;
++    }
++
++    if (beta_loss > 0.f) {
++        const float transmit_in = _EXP(log_transmit_in);
++        beta_loss *= (1 - transmit_in / (1 - transmit_in + 1e-3));
++        accum += beta_loss;
++    }
++
++    float t = ray.tmin;
++    float log_transmit = 0.f;
++
++    while (t <= ray.tmax) {
++#pragma unroll 3
++        for (int j = 0; j < 3; ++j) {
++            ray.pos[j] = fmaf(t, ray.dir[j], ray.origin[j]);
++            ray.pos[j] = min(max(ray.pos[j], 0.f), grid.size[j] - 1.f);
++            ray.l[j] = min(static_cast<int32_t>(ray.pos[j]), grid.size[j] - 2);
++            ray.pos[j] -= static_cast<float>(ray.l[j]);
++        }
++        const float skip = compute_skip_dist(ray,
++                       grid.links, grid.stride_x,
++                       grid.size[2], 0);
++        if (skip >= opt.step_size) {
++            t += ceilf(skip / opt.step_size) * opt.step_size;
++            continue;
++        }
++
++        float sigma = trilerp_cuvol_one(
++                grid.links, grid.density_data,
++                grid.stride_x, grid.size[2],
++                1, ray.l, ray.pos, 0);
++        if (opt.last_sample_opaque && t + opt.step_size > ray.tmax) {
++            ray.world_step = 1e9;
++        }
++
++        if (sigma > opt.sigma_thresh) {
++            const float pcnt = ray.world_step * sigma;
++            const float weight = _EXP(log_transmit) * (1.f - _EXP(-pcnt));
++            log_transmit -= pcnt;
++
++            // Compute color totals and gradients per channel sequentially
++            float total_color_dot_gout = 0.f;
++
++            for (int color_ch = 0; color_ch < 3; ++color_ch) {
++                float lane_color = 0.f;
++                float contrib = 0.f;
++                if (is_active) {
++                    lane_color = trilerp_cuvol_one(
++                        grid.links, grid.sh_data,
++                        grid.stride_x, grid.size[2],
++                        grid.sh_data_dim,
++                        ray.l, ray.pos,
++                        color_ch * grid.basis_dim + lane_id);
++                    contrib = lane_color * sphfunc_val[lane_id];
++                }
++                // Full warp reduce
++                for (int offset = 16; offset > 0; offset >>= 1) {
++                    contrib += __shfl_down_sync(0xFFFFFFFF, contrib, offset);
++                }
++                // Broadcast color total to all threads
++                float color_total_raw = __shfl_sync(0xFFFFFFFF, contrib, 0) + 0.5f;
++                float color_total = fmaxf(color_total_raw, 0.f);
++                float color_in_01 = (color_total == color_total_raw) ? 1.f : 0.f;
++
++                total_color_dot_gout += color_total * grad_output[color_ch];
++
++                // SH coefficient gradient
++                float grad_common = weight * color_in_01 * grad_output[color_ch];
++                if (is_active) {
++                    float curr_grad_color = sphfunc_val[lane_id] * grad_common;
++                    trilerp_backward_cuvol_one(grid.links, grads.grad_sh_out,
++                            grid.stride_x, grid.size[2],
++                            grid.sh_data_dim,
++                            ray.l, ray.pos,
++                            curr_grad_color,
++                            color_ch * grid.basis_dim + lane_id);
++
++                    // SH basis gradient (for non-SH basis types)
++                    if (grid.basis_type != BASIS_TYPE_SH) {
++                        grad_sphfunc_val[lane_id] += lane_color * grad_common;
++                    }
++                }
++            }
++
++            accum -= weight * total_color_dot_gout;
++            float curr_grad_sigma = ray.world_step * (
++                    total_color_dot_gout * _EXP(log_transmit) - accum);
++            if (sparsity_loss > 0.f) {
++                curr_grad_sigma += sparsity_loss * (4 * sigma / (1 + 2 * (sigma * sigma)));
++            }
++            if (lane_id == 0) {
++                trilerp_backward_cuvol_one_density(
++                        grid.links,
++                        grads.grad_density_out,
++                        grads.mask_out,
++                        grid.stride_x,
++                        grid.size[2],
++                        ray.l, ray.pos, curr_grad_sigma);
++            }
++            if (_EXP(log_transmit) < opt.stop_thresh) {
++                break;
++            }
++        }
++        t += opt.step_size;
++    }
++    if (lane_id == 0) {
++        if (accum_out != nullptr) {
++            accum -= beta_loss;
++            *accum_out = accum;
++        }
++        if (log_transmit_out != nullptr) { *log_transmit_out = log_transmit; }
++    }
++}
++
+ // BEGIN KERNELS
+ 
+ __launch_bounds__(TRACE_RAY_CUDA_THREADS, MIN_BLOCKS_PER_SM)
+@@ -620,10 +861,12 @@ __global__ void render_ray_kernel(
+     const int ray_blk_id = threadIdx.x >> 5;
+     const int lane_id = threadIdx.x & 0x1F;
+ 
+-    if (lane_id >= grid.sh_data_dim)  // Bad, but currently the best way due to coalesced memory access
++    // For basis_dim <= 10: threads beyond sh_data_dim exit early
++    // For basis_dim > 10: all 32 threads stay alive (sequential path)
++    if (grid.basis_dim <= 10 && lane_id >= grid.sh_data_dim)
+         return;
+ 
+-    __shared__ float sphfunc_val[TRACE_RAY_CUDA_RAYS_PER_BLOCK][9];
++    __shared__ float sphfunc_val[TRACE_RAY_CUDA_RAYS_PER_BLOCK][25];
+     __shared__ SingleRaySpec ray_spec[TRACE_RAY_CUDA_RAYS_PER_BLOCK];
+     __shared__ typename WarpReducef::TempStorage temp_storage[
+         TRACE_RAY_CUDA_RAYS_PER_BLOCK];
+@@ -634,17 +877,28 @@ __global__ void render_ray_kernel(
+                  ray_spec[ray_blk_id].dir,
+                  sphfunc_val[ray_blk_id]);
+     ray_find_bounds(ray_spec[ray_blk_id], grid, opt, ray_id);
+-    __syncwarp((1U << grid.sh_data_dim) - 1);
++    __syncwarp(min(grid.sh_data_dim, WARP_SIZE) >= 32 ? 0xFFFFFFFFU : (1U << min(grid.sh_data_dim, WARP_SIZE)) - 1);
+ 
+-    trace_ray_cuvol(
+-        grid,
+-        ray_spec[ray_blk_id],
+-        opt,
+-        lane_id,
+-        sphfunc_val[ray_blk_id],
+-        temp_storage[ray_blk_id],
+-        out[ray_id].data(),
+-        log_transmit_out == nullptr ? nullptr : log_transmit_out + ray_id);
++    if (grid.basis_dim > 10) {
++        trace_ray_cuvol_sequential(
++            grid,
++            ray_spec[ray_blk_id],
++            opt,
++            lane_id,
++            sphfunc_val[ray_blk_id],
++            out[ray_id].data(),
++            log_transmit_out == nullptr ? nullptr : log_transmit_out + ray_id);
++    } else {
++        trace_ray_cuvol(
++            grid,
++            ray_spec[ray_blk_id],
++            opt,
++            lane_id,
++            sphfunc_val[ray_blk_id],
++            temp_storage[ray_blk_id],
++            out[ray_id].data(),
++            log_transmit_out == nullptr ? nullptr : log_transmit_out + ray_id);
++    }
+ }
+ 
+ __launch_bounds__(TRACE_RAY_CUDA_THREADS, MIN_BLOCKS_PER_SM)
+@@ -659,13 +913,13 @@ __global__ void render_ray_image_kernel(
+     const int ray_blk_id = threadIdx.x >> 5;
+     const int lane_id = threadIdx.x & 0x1F;
+ 
+-    if (lane_id >= grid.sh_data_dim)
++    if (grid.basis_dim <= 10 && lane_id >= grid.sh_data_dim)
+         return;
+ 
+     const int ix = ray_id % cam.width;
+     const int iy = ray_id / cam.width;
+ 
+-    __shared__ float sphfunc_val[TRACE_RAY_CUDA_RAYS_PER_BLOCK][9];
++    __shared__ float sphfunc_val[TRACE_RAY_CUDA_RAYS_PER_BLOCK][25];
+     __shared__ SingleRaySpec ray_spec[TRACE_RAY_CUDA_RAYS_PER_BLOCK];
+     __shared__ typename WarpReducef::TempStorage temp_storage[
+         TRACE_RAY_CUDA_RAYS_PER_BLOCK];
+@@ -676,17 +930,28 @@ __global__ void render_ray_image_kernel(
+                  ray_spec[ray_blk_id].dir,
+                  sphfunc_val[ray_blk_id]);
+     ray_find_bounds(ray_spec[ray_blk_id], grid, opt, ray_id);
+-    __syncwarp((1U << grid.sh_data_dim) - 1);
++    __syncwarp(min(grid.sh_data_dim, WARP_SIZE) >= 32 ? 0xFFFFFFFFU : (1U << min(grid.sh_data_dim, WARP_SIZE)) - 1);
+ 
+-    trace_ray_cuvol(
+-        grid,
+-        ray_spec[ray_blk_id],
+-        opt,
+-        lane_id,
+-        sphfunc_val[ray_blk_id],
+-        temp_storage[ray_blk_id],
+-        out + ray_id * 3,
+-        log_transmit_out == nullptr ? nullptr : log_transmit_out + ray_id);
++    if (grid.basis_dim > 10) {
++        trace_ray_cuvol_sequential(
++            grid,
++            ray_spec[ray_blk_id],
++            opt,
++            lane_id,
++            sphfunc_val[ray_blk_id],
++            out + ray_id * 3,
++            log_transmit_out == nullptr ? nullptr : log_transmit_out + ray_id);
++    } else {
++        trace_ray_cuvol(
++            grid,
++            ray_spec[ray_blk_id],
++            opt,
++            lane_id,
++            sphfunc_val[ray_blk_id],
++            temp_storage[ray_blk_id],
++            out + ray_id * 3,
++            log_transmit_out == nullptr ? nullptr : log_transmit_out + ray_id);
++    }
+ }
+ 
+ __launch_bounds__(TRACE_RAY_BKWD_CUDA_THREADS, MIN_BLOCKS_PER_SM)
+@@ -708,11 +973,11 @@ __global__ void render_ray_backward_kernel(
+     const int ray_blk_id = threadIdx.x >> 5;
+     const int lane_id = threadIdx.x & 0x1F;
+ 
+-    if (lane_id >= grid.sh_data_dim)
++    if (grid.basis_dim <= 10 && lane_id >= grid.sh_data_dim)
+         return;
+ 
+-    __shared__ float sphfunc_val[TRACE_RAY_BKWD_CUDA_RAYS_PER_BLOCK][9];
+-    __shared__ float grad_sphfunc_val[TRACE_RAY_CUDA_RAYS_PER_BLOCK][9];
++    __shared__ float sphfunc_val[TRACE_RAY_BKWD_CUDA_RAYS_PER_BLOCK][25];
++    __shared__ float grad_sphfunc_val[TRACE_RAY_CUDA_RAYS_PER_BLOCK][25];
+     __shared__ SingleRaySpec ray_spec[TRACE_RAY_BKWD_CUDA_RAYS_PER_BLOCK];
+     __shared__ typename WarpReducef::TempStorage temp_storage[
+         TRACE_RAY_CUDA_RAYS_PER_BLOCK];
+@@ -746,23 +1011,42 @@ __global__ void render_ray_backward_kernel(
+         }
+     }
+ 
+-    __syncwarp((1U << grid.sh_data_dim) - 1);
+-    trace_ray_cuvol_backward(
+-        grid,
+-        grad_out,
+-        color_cache + ray_id * 3,
+-        ray_spec[ray_blk_id],
+-        opt,
+-        lane_id,
+-        sphfunc_val[ray_blk_id],
+-        grad_sphfunc_val[ray_blk_id],
+-        temp_storage[ray_blk_id],
+-        log_transmit_in == nullptr ? 0.f : log_transmit_in[ray_id],
+-        beta_loss,
+-        sparsity_loss,
+-        grads,
+-        accum_out == nullptr ? nullptr : accum_out + ray_id,
+-        log_transmit_out == nullptr ? nullptr : log_transmit_out + ray_id);
++    __syncwarp(min(grid.sh_data_dim, WARP_SIZE) >= 32 ? 0xFFFFFFFFU : (1U << min(grid.sh_data_dim, WARP_SIZE)) - 1);
++
++    if (grid.basis_dim > 10) {
++        trace_ray_cuvol_backward_sequential(
++            grid,
++            grad_out,
++            color_cache + ray_id * 3,
++            ray_spec[ray_blk_id],
++            opt,
++            lane_id,
++            sphfunc_val[ray_blk_id],
++            grad_sphfunc_val[ray_blk_id],
++            log_transmit_in == nullptr ? 0.f : log_transmit_in[ray_id],
++            beta_loss,
++            sparsity_loss,
++            grads,
++            accum_out == nullptr ? nullptr : accum_out + ray_id,
++            log_transmit_out == nullptr ? nullptr : log_transmit_out + ray_id);
++    } else {
++        trace_ray_cuvol_backward(
++            grid,
++            grad_out,
++            color_cache + ray_id * 3,
++            ray_spec[ray_blk_id],
++            opt,
++            lane_id,
++            sphfunc_val[ray_blk_id],
++            grad_sphfunc_val[ray_blk_id],
++            temp_storage[ray_blk_id],
++            log_transmit_in == nullptr ? 0.f : log_transmit_in[ray_id],
++            beta_loss,
++            sparsity_loss,
++            grads,
++            accum_out == nullptr ? nullptr : accum_out + ray_id,
++            log_transmit_out == nullptr ? nullptr : log_transmit_out + ray_id);
++    }
+     calc_sphfunc_backward(
+                  grid, lane_id,
+                  ray_id,
+diff --git a/svox2/csrc/svox2.cpp b/svox2/csrc/svox2.cpp
+index 4a53b75..608f04c 100644
+--- a/svox2/csrc/svox2.cpp
++++ b/svox2/csrc/svox2.cpp
+@@ -71,6 +71,12 @@ void rmsprop_step(Tensor, Tensor, Tensor, Tensor, float, float, float, float,
+                   float);
+ void sgd_step(Tensor, Tensor, Tensor, float, float);
+ 
++// Mod 5: Weighted RMSprop with per-voxel LR
++void rmsprop_weighted_step(Tensor, Tensor, Tensor, Tensor, Tensor, float,
++                           float, float, float, float);
++// Mod 6: Anchor gradient regularization
++void anchor_grad_step(Tensor, Tensor, Tensor, Tensor, float);
++
+ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
+ #define _REG_FUNC(funname) m.def(#funname, &funname)
+   _REG_FUNC(sample_grid);
+@@ -109,6 +115,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
+   // Optimizer
+   _REG_FUNC(rmsprop_step);
+   _REG_FUNC(sgd_step);
++  _REG_FUNC(rmsprop_weighted_step);
++  _REG_FUNC(anchor_grad_step);
+ #undef _REG_FUNC
+ 
+   py::class_<SparseGridSpec>(m, "SparseGridSpec")
+diff --git a/svox2/svox2.py b/svox2/svox2.py
+index 25ce3f1..d09eef9 100644
+--- a/svox2/svox2.py
++++ b/svox2/svox2.py
+@@ -1310,6 +1310,10 @@ class SparseGrid(nn.Module):
+             self.sh_data.grad = None
+             self.sparse_grad_indexer = None
+             self.sparse_sh_grad_indexer = None
++            # Mod 2: Save old RMS state for remapping after resample
++            _old_density_rms = self.density_rms
++            _old_sh_rms = self.sh_rms
++            _old_links_for_rms = self.links.clone() if self.density_rms is not None else None
+             self.density_rms = None
+             self.sh_rms = None
+ 
+@@ -1423,6 +1427,248 @@ class SparseGrid(nn.Module):
+             if accelerate and self.links.is_cuda:
+                 self.accelerate()
+ 
++            # Mod 2: Remap optimizer state to new grid indices
++            if _old_density_rms is not None and _old_links_for_rms is not None:
++                try:
++                    old_flat = _old_links_for_rms.reshape(-1)
++                    new_flat = self.links.reshape(-1)
++                    both_occ = (old_flat >= 0) & (new_flat >= 0)
++                    old_idx = old_flat[both_occ].long()
++                    new_idx = new_flat[both_occ].long()
++
++                    self.density_rms = torch.zeros_like(self.density_data.data)
++                    self.density_rms[new_idx] = _old_density_rms[old_idx].to(device)
++
++                    if _old_sh_rms is not None:
++                        n_sh_common = min(
++                            _old_sh_rms.shape[1], self.sh_data.shape[1]
++                        )
++                        self.sh_rms = torch.zeros_like(self.sh_data.data)
++                        self.sh_rms[new_idx, :n_sh_common] = (
++                            _old_sh_rms[old_idx, :n_sh_common].to(device)
++                        )
++                    n_remapped = both_occ.sum().item()
++                    n_new = (new_flat >= 0).sum().item()
++                    print(f" RMS state: remapped {n_remapped}/{n_new} voxels")
++                except Exception as e:
++                    print(f" RMS remap failed ({e}), starting fresh")
++                    self.density_rms = None
++                    self.sh_rms = None
++            del _old_density_rms, _old_sh_rms, _old_links_for_rms
++
++
++    def sparse_upsample(
++        self,
++        new_reso: int,
++        sigma_thresh: float = 5.0,
++        dilate: int = 2,
++        accelerate: bool = True,
++    ):
++        """Sparse-to-sparse upsample: only materializes occupied region.
++
++        Unlike resample(), which generates all R_out^3 points, this method:
++        1. Upsamples the old occupancy mask (dilated) to new resolution
++        2. Only queries points in the occupied region
++        3. Thresholds and builds new sparse grid
++
++        Memory: O(occupied_voxels) instead of O(R^3).
++        For 520->1032 with ~5% occupancy: ~50M pts instead of 1.1B.
++
++        Args:
++            new_reso: target resolution (isotropic)
++            sigma_thresh: density threshold for keeping voxels
++            dilate: dilation iterations on occupancy mask
++            accelerate: if True, rebuilds distance transform after upsample
++        """
++        with torch.no_grad():
++            device = self.links.device
++            curr_reso = list(self.links.shape)
++            reso = [new_reso] * 3
++
++            # --- Step 1: Build dilated occupancy mask at OLD resolution ---
++            occ_mask = (self.links >= 0)  # (Rx, Ry, Rz) bool
++            if dilate > 0:
++                for _ in range(dilate):
++                    occ_mask = _C.dilate(occ_mask)
++
++            # --- Step 2: Upsample occupancy mask to NEW resolution ---
++            # Each old voxel maps to a block of (scale x scale x scale) new voxels
++            scale = [reso[i] / curr_reso[i] for i in range(3)]
++            # Use nearest-neighbor upsample of the mask
++            occ_float = occ_mask.float().unsqueeze(0).unsqueeze(0)  # (1,1,Rx,Ry,Rz)
++            occ_up = torch.nn.functional.interpolate(
++                occ_float,
++                size=reso,
++                mode="nearest",
++            ).squeeze(0).squeeze(0) > 0.5  # (new_R, new_R, new_R) bool
++
++            # Additional dilation at new resolution for safety
++            if dilate > 0:
++                for _ in range(dilate):
++                    occ_up = _C.dilate(occ_up)
++
++            n_candidate = occ_up.sum().item()
++            n_total = reso[0] * reso[1] * reso[2]
++            print(f"  Sparse upsample: {n_candidate}/{n_total} candidate voxels "
++                  f"({100*n_candidate/n_total:.1f}%)")
++
++            # --- Step 3: Generate grid coords only for candidate voxels ---
++            dtype = torch.float32
++            reso_facts = [0.5 * curr_reso[i] / reso[i] for i in range(3)]
++
++            # Get indices of candidate voxels
++            cand_idx = torch.nonzero(occ_up, as_tuple=False)  # (N_cand, 3) int64
++
++            # Convert to grid coords in old-grid space
++            points = torch.zeros(n_candidate, 3, dtype=dtype, device=device)
++            for dim in range(3):
++                points[:, dim] = (
++                    reso_facts[dim] - 0.5
++                    + cand_idx[:, dim].float()
++                    * (curr_reso[dim] - 2 * reso_facts[dim])
++                    / (reso[dim] - 1)
++                )
++
++            # --- Step 4: Sample density at candidate points ---
++            batch_size = 720720
++            all_density = []
++            print(f"  Pass 1/2 (density): {n_candidate} points")
++            for i in range(0, n_candidate, batch_size):
++                d, _ = self.sample(
++                    points[i:i+batch_size], grid_coords=True, want_colors=False
++                )
++                all_density.append(d)
++
++            density_vals = torch.cat(all_density, dim=0).squeeze(-1)  # (N_cand,)
++            del all_density
++
++            # --- Step 5: Threshold ---
++            keep_mask = density_vals >= sigma_thresh
++            n_keep = keep_mask.sum().item()
++            print(f"  Threshold {sigma_thresh}: keeping {n_keep}/{n_candidate} voxels")
++
++            if n_keep == 0:
++                print("  WARNING: No voxels survived threshold!")
++                return
++
++            # --- Step 6: Sample SH at surviving points ---
++            kept_points = points[keep_mask]
++            all_sh = []
++            print(f"  Pass 2/2 (color): {n_keep} points")
++            for i in range(0, n_keep, batch_size):
++                _, sh = self.sample(
++                    kept_points[i:i+batch_size], grid_coords=True, want_colors=True
++                )
++                all_sh.append(sh)
++
++            kept_density = density_vals[keep_mask].view(-1, 1)
++            kept_sh = torch.cat(all_sh, dim=0)
++            del all_sh, density_vals, points
++
++            # --- Step 7: Build new links tensor ---
++            # Map candidate indices to flat positions in new grid
++            # Only kept voxels get positive link indices
++            kept_cand_idx = cand_idx[keep_mask]  # (N_keep, 3)
++
++            init_links = torch.full(
++                (reso[0] * reso[1] * reso[2],),
++                fill_value=-1, dtype=torch.int32, device=device,
++            )
++            flat_pos = (
++                kept_cand_idx[:, 0] * reso[1] * reso[2]
++                + kept_cand_idx[:, 1] * reso[2]
++                + kept_cand_idx[:, 2]
++            )
++            init_links[flat_pos] = torch.arange(
++                n_keep, dtype=torch.int32, device=device
++            )
++
++            # --- Step 8: Interpolate RMS state at new positions (before grid swap) ---
++            # Temporarily swap grid data with RMS tensors, sample at kept_points,
++            # then swap back. This trilinearly interpolates the optimizer state
++            # from old to new grid, avoiding cold-start LR amplification.
++            interp_density_rms = None
++            interp_sh_rms = None
++            if self.density_rms is not None:
++                try:
++                    # Save originals
++                    orig_density = self.density_data.data.clone()
++                    orig_sh = self.sh_data.data.clone()
++
++                    # Swap density_data with density_rms for sampling
++                    self.density_data.data.copy_(self.density_rms)
++                    all_rms_d = []
++                    for i in range(0, n_keep, batch_size):
++                        rd, _ = self.sample(
++                            kept_points[i:i+batch_size],
++                            grid_coords=True, want_colors=False,
++                        )
++                        all_rms_d.append(rd)
++                    interp_density_rms = torch.cat(all_rms_d, dim=0)
++                    # Clamp to non-negative (RMS values are always >= 0)
++                    interp_density_rms.clamp_(min=0.0)
++                    del all_rms_d
++
++                    # Swap sh_data with sh_rms for sampling
++                    if self.sh_rms is not None:
++                        self.density_data.data.copy_(orig_density)  # restore density for trilerp
++                        self.sh_data.data.copy_(self.sh_rms)
++                        all_rms_sh = []
++                        for i in range(0, n_keep, batch_size):
++                            _, rsh = self.sample(
++                                kept_points[i:i+batch_size],
++                                grid_coords=True, want_colors=True,
++                            )
++                            all_rms_sh.append(rsh)
++                        interp_sh_rms = torch.cat(all_rms_sh, dim=0)
++                        interp_sh_rms.clamp_(min=0.0)
++                        del all_rms_sh
++
++                    # Restore original data
++                    self.density_data.data.copy_(orig_density)
++                    self.sh_data.data.copy_(orig_sh)
++                    del orig_density, orig_sh
++
++                    n_nonzero_d = (interp_density_rms.abs() > 0).sum().item()
++                    print(f"  RMS interpolation: {n_nonzero_d}/{n_keep} density voxels have non-zero RMS")
++                except Exception as e:
++                    print(f"  RMS interpolation failed ({e}), will start fresh")
++                    interp_density_rms = None
++                    interp_sh_rms = None
++
++            # --- Step 9: Replace grid data ---
++            self.density_data.grad = None
++            self.sh_data.grad = None
++            self.sparse_grad_indexer = None
++            self.sparse_sh_grad_indexer = None
++            self.density_rms = None
++            self.sh_rms = None
++
++            del self.density_data, self.sh_data
++            self.capacity = n_keep
++            self.density_data = nn.Parameter(kept_density.to(device=device))
++            self.sh_data = nn.Parameter(kept_sh.to(device=device))
++            self.links = init_links.view(reso).to(device=device)
++
++            print(f"  New cap: {self.capacity}")
++            print(f"  density {self.density_data.shape} {self.density_data.dtype}")
++            print(f"  sh {self.sh_data.shape} {self.sh_data.dtype}")
++            print(f"  links {self.links.shape} {self.links.dtype}")
++
++            if accelerate and self.links.is_cuda:
++                self.accelerate()
++
++            # --- Step 10: Apply interpolated RMS state ---
++            if interp_density_rms is not None:
++                self.density_rms = interp_density_rms.view_as(self.density_data.data)
++                if interp_sh_rms is not None:
++                    # Handle SH dim change (e.g., SH degree upgrade)
++                    n_common = min(interp_sh_rms.shape[1], self.sh_data.shape[1])
++                    self.sh_rms = torch.zeros_like(self.sh_data.data)
++                    self.sh_rms[:, :n_common] = interp_sh_rms[:, :n_common]
++                print(f"  RMS state: interpolated from old grid")
++            del interp_density_rms, interp_sh_rms
++
+     def sparsify_background(
+         self,
+         sigma_thresh: float = 1.0,
+@@ -2040,6 +2286,118 @@ class SparseGrid(nn.Module):
+         else:
+             raise NotImplementedError(f'Unsupported optimizer {optim}')
+ 
++
++    # =============================================
++    # Mod 5: Per-voxel hit count and adaptive LR
++    # =============================================
++
++    def init_hit_count(self):
++        """Initialize per-voxel hit counter (call after resample)."""
++        self.hit_count = torch.zeros(
++            self.density_data.size(0), dtype=torch.int32,
++            device=self.density_data.device,
++        )
++
++    def update_hit_count(self):
++        """Increment hit counts for voxels touched by last backward pass."""
++        if self.sparse_grad_indexer is not None and hasattr(self, 'hit_count'):
++            self.hit_count[self.sparse_grad_indexer] += 1
++
++    def compute_lr_weights(self, min_weight: float = 0.1, max_weight: float = 3.0):
++        """Compute per-voxel LR multiplier from hit counts.
++
++        Under-sampled voxels get higher LR, over-sampled get lower.
++        Formula: w = sqrt(mean_hits / max(hits, 1)), clamped to [min, max].
++        """
++        if not hasattr(self, 'hit_count') or self.hit_count is None:
++            return None
++        hits = self.hit_count.float()
++        mean_hits = hits[hits > 0].mean() if (hits > 0).any() else 1.0
++        weights = torch.sqrt(mean_hits / hits.clamp(min=1))
++        weights = weights.clamp(min=min_weight, max=max_weight)
++        return weights
++
++    def optim_density_step_weighted(
++        self, lr: float, lr_weights: torch.Tensor,
++        beta: float = 0.9, epsilon: float = 1e-8,
++    ):
++        """RMSprop step on density with per-voxel LR weighting."""
++        assert _C is not None and self.sh_data.is_cuda
++        indexer = self._maybe_convert_sparse_grad_indexer()
++        if self.density_rms is None or self.density_rms.shape != self.density_data.shape:
++            del self.density_rms
++            self.density_rms = torch.zeros_like(self.density_data.data)
++        _C.rmsprop_weighted_step(
++            self.density_data.data,
++            self.density_rms,
++            self.density_data.grad,
++            indexer,
++            lr_weights,
++            beta, lr, epsilon, -1e9, lr,
++        )
++
++    def optim_sh_step_weighted(
++        self, lr: float, lr_weights: torch.Tensor,
++        beta: float = 0.9, epsilon: float = 1e-8,
++    ):
++        """RMSprop step on SH with per-voxel LR weighting."""
++        assert _C is not None and self.sh_data.is_cuda
++        indexer = self._maybe_convert_sparse_grad_indexer(sh=True)
++        if self.sh_rms is None or self.sh_rms.shape != self.sh_data.shape:
++            del self.sh_rms
++            self.sh_rms = torch.zeros_like(self.sh_data.data)
++        _C.rmsprop_weighted_step(
++            self.sh_data.data,
++            self.sh_rms,
++            self.sh_data.grad,
++            indexer,
++            lr_weights,
++            beta, lr, epsilon, -1e9, lr,
++        )
++
++    # =============================================
++    # Mod 6: Fused anchor gradient regularization
++    # =============================================
++
++    def apply_anchor_grad(
++        self,
++        anchor_density: torch.Tensor,
++        anchor_sh: torch.Tensor,
++        lambda_density: float,
++        lambda_sh: float,
++    ):
++        """Add anchor regularization gradients (CUDA-fused).
++
++        Must be called AFTER backward() and BEFORE optim_*_step().
++        Only modifies gradients for voxels touched by the last backward pass.
++
++        Args:
++            anchor_density: (N, 1) anchor density values (same layout as density_data)
++            anchor_sh: (N, C) anchor SH values (same layout as sh_data)
++            lambda_density: regularization weight for density
++            lambda_sh: regularization weight for SH
++        """
++        assert _C is not None and self.density_data.is_cuda
++        if self.sparse_grad_indexer is None:
++            return
++        mask = self.sparse_grad_indexer
++        if self.density_data.grad is not None and lambda_density > 0:
++            _C.anchor_grad_step(
++                self.density_data.data,
++                self.density_data.grad,
++                anchor_density,
++                mask,
++                lambda_density,
++            )
++        if self.sh_data.grad is not None and lambda_sh > 0:
++            _C.anchor_grad_step(
++                self.sh_data.data,
++                self.sh_data.grad,
++                anchor_sh,
++                mask,
++                lambda_sh,
++            )
++
+     def optim_background_step(self,
+                               lr_sigma: float,
+                               lr_color: float,
+diff --git a/svox2/utils.py b/svox2/utils.py
+index 2a89c9c..455daef 100644
+--- a/svox2/utils.py
++++ b/svox2/utils.py
+@@ -111,7 +111,7 @@ SH_C4 = [
+     0.6258357354491761,
+ ]
+ 
+-MAX_SH_BASIS = 10
++MAX_SH_BASIS = 25
+ def eval_sh_bases(basis_dim : int, dirs : torch.Tensor):
+     """
+     Evaluate spherical harmonics bases at unit directions,

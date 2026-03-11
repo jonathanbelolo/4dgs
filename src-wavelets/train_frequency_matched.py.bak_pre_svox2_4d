@@ -630,7 +630,6 @@ def train_stage_svox2(
     is_resume: bool = False,
     batch_rays_override: int | None = None,
     density_grad_thresh: float = 0.0,  # dead zone: zero out small density grads
-    use_adaptive_lr: bool = False,  # Mod 5: per-voxel hit count + weighted RMSprop
 ) -> dict:
     """Train one stage using svox2's CUDA optimizer (RMSProp).
 
@@ -730,13 +729,6 @@ def train_stage_svox2(
     no_improve_count = 0
     best_ckpt_path = os.path.join(out_dir, f"best_{stage_name}.npz")
     min_iters = lr_sigma_delay_steps * 3  # don't stop until well past warm-up
-
-    # Adaptive LR: per-voxel hit count for weighted optimizer (Mod 5)
-    adaptive_lr_weights = None
-    if use_adaptive_lr:
-        svox2_grid.init_hit_count()
-        lr_weight_update_every = 500
-        print(f"  Adaptive LR enabled: hit count tracking + weighted RMSprop")
 
     for iteration in range(stage_iters):
         # LR with exponential decay + density warm-up.
@@ -847,12 +839,6 @@ def train_stage_svox2(
                         )
                     )
 
-        # Adaptive LR: track which voxels are hit by rays
-        if use_adaptive_lr:
-            svox2_grid.update_hit_count()
-            if iteration > 0 and iteration % lr_weight_update_every == 0:
-                adaptive_lr_weights = svox2_grid.compute_lr_weights()
-
         # Density gradient dead zone: zero out small gradients so only
         # meaningful high-frequency corrections pass through.
         if density_grad_thresh > 0 and svox2_grid.density_data.grad is not None:
@@ -860,12 +846,8 @@ def train_stage_svox2(
             svox2_grid.density_data.grad[mask] = 0.0
 
         # Custom CUDA optimizer step (RMSProp with sparse updates)
-        if use_adaptive_lr and adaptive_lr_weights is not None:
-            svox2_grid.optim_density_step_weighted(cur_lr_s, adaptive_lr_weights, beta=0.95)
-            svox2_grid.optim_sh_step_weighted(cur_lr_sh, adaptive_lr_weights, beta=0.95)
-        else:
-            svox2_grid.optim_density_step(cur_lr_s, beta=0.95, optim="rmsprop")
-            svox2_grid.optim_sh_step(cur_lr_sh, beta=0.95, optim="rmsprop")
+        svox2_grid.optim_density_step(cur_lr_s, beta=0.95, optim="rmsprop")
+        svox2_grid.optim_sh_step(cur_lr_sh, beta=0.95, optim="rmsprop")
 
         # Sparsification: remove low-density fog voxels periodically.
         # Dense anchor base survives layout changes (indexed by spatial position).
@@ -879,12 +861,9 @@ def train_stage_svox2(
                 weight_thresh=0.0, dilate=1, use_z_order=False,
             )
             n_after = svox2_grid.density_data.shape[0]
-            if n_after != n_before:
-                print(f"  [resample] {n_before:,} -> {n_after:,} voxels "
-                      f"({100*n_after/n_before:.1f}%)")
-                # Reinitialize hit count after any layout change
-                if use_adaptive_lr:
-                    svox2_grid.init_hit_count()
+            if n_after < n_before:
+                print(f"  [sparsify] {n_before:,} -> {n_after:,} voxels "
+                      f"({100*n_after/n_before:.1f}% kept)")
 
         global_iter = global_iter_offset + iteration
 
@@ -1148,14 +1127,15 @@ def train_single_stage(
             anchor_sparse_data = None
 
         elif use_sparse_upsample:
-            # Large grid: sparse upsample via svox2-4d CUDA sampling.
-            # Also preserves RMS optimizer state across resolutions.
-            print(f"  Sparse upsample {prev_vol_res}\u00b3 -> {vol_res}\u00b3 "
-                  f"(svox2-4d, RMS preserved)...", flush=True)
-            prev_grid.sparse_upsample(vol_res, sigma_thresh=5.0, dilate=1)
-            svox2_grid = prev_grid
-            svox2_grid.opt.near_clip = 0.0
-            svox2_grid.opt.background_brightness = 1.0
+            # Large grid: channel-by-channel trilinear upsample
+            # (avoids materializing dense vol_res³ × 28 tensor, ~5 GB peak)
+            svox2_grid = sparse_trilinear_upsample_svox2(
+                prev_grid, vol_res,
+                scene_bound=config.scene_bound,
+                sh_dim=sh_dim,
+                sigma_thresh=5.0,
+            )
+            del prev_grid
             torch.cuda.empty_cache()
 
             # Sparse anchor: clone links + data (~7 GB for 1032³)
@@ -1259,10 +1239,6 @@ def train_single_stage(
             la_d = 1e-2 * tv_sh_scale
             la_sh = 1e-1 * tv_sh_scale
         print(f"  Anchor lambdas: density={la_d:.1e}, sh={la_sh:.1e}", flush=True)
-
-    # Enable adaptive LR for large grids (Mod 5: per-voxel weighted RMSprop)
-    use_adaptive_lr = use_sparse_upsample if resume_from is not None else False
-
     metrics = train_stage_svox2(
         svox2_grid, train_data, val_data, config,
         stage_iters=stage_iters,
@@ -1281,7 +1257,6 @@ def train_single_stage(
         is_resume=(resume_from is not None),
         batch_rays_override=16384 if (resume_from and use_sparse_upsample) else None,
         density_grad_thresh=1e-4 if (resume_from and use_sparse_upsample) else 0.0,
-        use_adaptive_lr=use_adaptive_lr,
     )
 
     # --- Reload best checkpoint if early stopped ---
