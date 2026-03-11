@@ -51,18 +51,18 @@ class StageConfig:
 
 
 STAGES = [
-    StageConfig(img_res=100, max_iters=15_000, max_gaussians=5_000,
-                densify_from=500, densify_until=10_000, sh_degree=0,
-                grad_threshold=0.0004, max_scale=0.1, init_points=1_000),
-    StageConfig(img_res=200, max_iters=20_000, max_gaussians=30_000,
+    StageConfig(img_res=100, max_iters=30_000, max_gaussians=100_000,
                 densify_from=500, densify_until=15_000, sh_degree=1,
-                grad_threshold=0.0002, max_scale=0.05, init_points=5_000),
-    StageConfig(img_res=400, max_iters=25_000, max_gaussians=150_000,
-                densify_from=500, densify_until=18_000, sh_degree=2,
-                grad_threshold=0.0001, max_scale=0.02, init_points=20_000),
-    StageConfig(img_res=800, max_iters=30_000, max_gaussians=500_000,
-                densify_from=500, densify_until=20_000, sh_degree=3,
-                grad_threshold=0.00005, max_scale=0.01, init_points=50_000),
+                grad_threshold=0.0002, max_scale=0.05, init_points=10_000),
+    StageConfig(img_res=200, max_iters=30_000, max_gaussians=200_000,
+                densify_from=500, densify_until=15_000, sh_degree=2,
+                grad_threshold=0.0001, max_scale=0.03, init_points=20_000),
+    StageConfig(img_res=400, max_iters=30_000, max_gaussians=500_000,
+                densify_from=500, densify_until=15_000, sh_degree=3,
+                grad_threshold=0.00008, max_scale=0.02, init_points=50_000),
+    StageConfig(img_res=800, max_iters=30_000, max_gaussians=1_000_000,
+                densify_from=500, densify_until=15_000, sh_degree=3,
+                grad_threshold=0.00005, max_scale=0.01, init_points=100_000),
 ]
 
 
@@ -386,8 +386,8 @@ def train_stage(model: MultiResModel, images: Tensor, camtoworlds: Tensor,
     """Train one resolution stage."""
     N, H, W, _ = images.shape
 
-    # LR scaling: finer stages use smaller learning rates
-    lr_scale = 0.5 ** stage_idx
+    # LR scaling: stage 0 uses full baseline LR, later stages scale down
+    lr_scale = 1.0 if stage_idx == 0 else 0.5 ** stage_idx
     lr_means_init = 0.00016 * scene_extent * lr_scale
     lr_means_final = lr_means_init * 0.01
 
@@ -395,7 +395,7 @@ def train_stage(model: MultiResModel, images: Tensor, camtoworlds: Tensor,
         model.active, lr_means_init,
         lr_scales=0.005 * lr_scale,
         lr_quats=0.001 * lr_scale,
-        lr_opacities=0.05,  # keep constant
+        lr_opacities=0.05,
         lr_sh0=0.0025 * lr_scale,
         lr_shN=0.000125 * lr_scale,
     )
@@ -567,11 +567,29 @@ def train_multires(args):
         N, H, W, _ = images.shape
 
         # Initialize new active layer
-        points, colors = init_gaussians_from_cameras(
-            camtoworlds, near, far, num_points=cfg.init_points, device=device,
-        )
+        # Stage 0: prefer SfM points if available
+        sfm_points, sfm_colors = None, None
+        if stage_idx == 0:
+            sfm_dir = Path(args.data_dir) / args.scene / "colmap"
+            if (sfm_dir / "points3d.npy").exists():
+                sfm_points = torch.from_numpy(
+                    np.load(str(sfm_dir / "points3d.npy"))
+                ).float().to(device)
+                sfm_colors = torch.from_numpy(
+                    np.load(str(sfm_dir / "colors3d.npy"))
+                ).float().to(device)
+                print(f"  Loaded {len(sfm_points):,} SfM points from {sfm_dir}")
+
+        if sfm_points is not None:
+            points, colors = sfm_points, sfm_colors
+        else:
+            points, colors = init_gaussians_from_cameras(
+                camtoworlds, near, far, num_points=cfg.init_points, device=device,
+            )
+
         model.create_active_layer(points, colors)
-        print(f"  Initialized {cfg.init_points:,} new Gaussians")
+        print(f"  Initialized {len(points):,} Gaussians"
+              f" ({'SfM' if sfm_points is not None else 'random'})")
 
         # Train this stage
         train_stage(
