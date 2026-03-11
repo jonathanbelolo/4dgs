@@ -119,14 +119,14 @@ def run_colmap_triangulation(work_dir, image_dir):
         "--image_path", str(image_dir),
         "--ImageReader.camera_model", "PINHOLE",
         "--ImageReader.single_camera", "1",
-        "--SiftExtraction.use_gpu", "0",
+        "--SiftExtraction.use_gpu", "1",
     ], check=True, capture_output=True)
 
-    print("  COLMAP: Feature matching...")
+    print("  COLMAP: Feature matching (GPU)...")
     subprocess.run([
         "colmap", "exhaustive_matcher",
         "--database_path", str(db_path),
-        "--SiftMatching.use_gpu", "0",
+        "--SiftMatching.use_gpu", "1",
     ], check=True, capture_output=True)
 
     # Now we need to overwrite the camera params and image poses in the DB
