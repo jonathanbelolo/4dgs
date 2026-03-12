@@ -42,10 +42,8 @@ def main():
     cam_names = []
 
     for cam_dir in cam_dirs:
-        # Use composited images (white bg) for better COLMAP features
-        src = cam_dir / "com" / f"{frame_str}.png"
-        if not src.exists():
-            src = cam_dir / "images" / f"{frame_str}.png"
+        # Use raw images (studio background provides texture for COLMAP matching)
+        src = cam_dir / "images" / f"{frame_str}.png"
         if not src.exists():
             print(f"  WARNING: No image for {cam_dir.name} frame {frame_str}")
             continue
@@ -127,8 +125,9 @@ def main():
         idx = name_to_idx[img_name]
 
         # World-to-camera: R | t
-        R = image.cam_from_world.rotation.matrix()
-        t = image.cam_from_world.translation
+        cfw = image.cam_from_world()  # pycolmap 3.13: method, not property
+        R = cfw.rotation.matrix()
+        t = cfw.translation
         w2c = np.eye(4)
         w2c[:3, :3] = R
         w2c[:3, 3] = t
@@ -138,14 +137,10 @@ def main():
         # Intrinsics
         cam = recon.cameras[image.camera_id]
         params = cam.params
-        if cam.model_name == "OPENCV":
+        model_name = str(cam.model).split(".")[-1]  # e.g. "OPENCV" from "CameraModelId.OPENCV"
+        if model_name in ("OPENCV", "PINHOLE"):
             fx, fy, cx, cy = params[0], params[1], params[2], params[3]
-        elif cam.model_name == "PINHOLE":
-            fx, fy, cx, cy = params[0], params[1], params[2], params[3]
-        elif cam.model_name == "SIMPLE_PINHOLE":
-            fx = fy = params[0]
-            cx, cy = params[1], params[2]
-        elif cam.model_name == "SIMPLE_RADIAL":
+        elif model_name in ("SIMPLE_PINHOLE", "SIMPLE_RADIAL"):
             fx = fy = params[0]
             cx, cy = params[1], params[2]
         else:
@@ -157,7 +152,7 @@ def main():
 
         # Track reprojection error
         for p2d in image.points2D:
-            if p2d.point3D_id >= 0 and p2d.point3D_id in recon.points3D:
+            if p2d.has_point3D() and p2d.point3D_id in recon.points3D:
                 reproj_errors.append(recon.points3D[p2d.point3D_id].error)
 
     n_registered = registered.sum()
