@@ -81,7 +81,6 @@ def run_hloc_sfm(images_dir, output_dir):
         features=features_path,
         matches=matches_path,
         camera_mode=pycolmap.CameraMode.SINGLE,
-        camera_model="SIMPLE_RADIAL",
     )
 
     return model
