@@ -190,7 +190,9 @@ def run_hmr2_on_crop(hmr2_model, image_pil, crop_rect, device="cuda"):
 
     with torch.no_grad():
         try:
-            output = hmr2_model(inp)
+            # HMR2.0 expects a dict with 'img' key
+            batch = {"img": inp}
+            output = hmr2_model(batch)
         except Exception as e:
             print(f"  HMR2.0 inference failed: {e}")
             return None
