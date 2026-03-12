@@ -207,11 +207,24 @@ def run_hmr2_on_crop(hmr2_model, image_pil, crop_rect, device="cuda"):
 
     result = {}
 
-    # Extract SMPL parameters (HMR2.0 outputs SMPL, not SMPL-X)
+    # Extract SMPL parameters (HMR2.0 outputs rotation matrices, not axis-angle)
+    from scipy.spatial.transform import Rotation as R_scipy
+
     if "pred_smpl_params" in pred:
         smpl_params = pred["pred_smpl_params"]
-        result["body_pose"] = smpl_params.get("body_pose", torch.zeros(1, 63))[0].cpu().numpy()
-        result["global_orient"] = smpl_params.get("global_orient", torch.zeros(1, 3))[0].cpu().numpy()
+
+        # body_pose: (1, 23, 3, 3) rotation matrices → (69,) axis-angle
+        bp = smpl_params.get("body_pose", torch.zeros(1, 23, 3, 3))
+        bp_np = bp[0].cpu().numpy()  # (23, 3, 3)
+        bp_aa = np.array([R_scipy.from_matrix(m).as_rotvec() for m in bp_np])  # (23, 3)
+        result["body_pose"] = bp_aa.flatten()  # (69,)
+
+        # global_orient: (1, 1, 3, 3) → (3,) axis-angle
+        go = smpl_params.get("global_orient", torch.zeros(1, 1, 3, 3))
+        go_np = go[0, 0].cpu().numpy()  # (3, 3)
+        result["global_orient"] = R_scipy.from_matrix(go_np).as_rotvec()  # (3,)
+
+        # betas: (1, 10) — already correct
         result["betas"] = smpl_params.get("betas", torch.zeros(1, 10))[0].cpu().numpy()
     else:
         # Fallback: try direct attribute access
@@ -375,8 +388,14 @@ def run_stage_a(scene_dir, canonical, calib, device="cuda"):
         raise RuntimeError("HMR2.0 failed on all cameras!")
 
     # Aggregate: median across cameras
+    # HMR2.0 outputs SMPL body_pose (23 joints = 69 values)
+    # SMPL-X body_pose has 21 joints = 63 values — truncate the last 2 joints
+    median_body_pose = np.median(all_body_pose, axis=0)
+    if len(median_body_pose) > 63:
+        median_body_pose = median_body_pose[:63]
+
     init_params = {
-        "body_pose": np.median(all_body_pose, axis=0),
+        "body_pose": median_body_pose,
         "betas": np.median(all_betas, axis=0),
     }
     if all_global_orient:
