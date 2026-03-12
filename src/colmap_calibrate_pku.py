@@ -1,6 +1,8 @@
 """Run COLMAP SfM on PKU-DyMVHumans frame 0 to calibrate all cameras.
 
-Uses composited images (com/, white background) for better feature matching.
+Uses hloc (SuperPoint + LightGlue) for robust wide-baseline feature matching
+in the dark studio environment, then runs COLMAP incremental SfM.
+
 Outputs calibration.npz with intrinsics, extrinsics, and sparse 3D points.
 
 Usage:
@@ -12,6 +14,77 @@ import numpy as np
 from pathlib import Path
 
 import pycolmap
+
+
+def run_hloc_sfm(images_dir, output_dir):
+    """Run hloc SuperPoint + LightGlue matching → COLMAP SfM.
+
+    Args:
+        images_dir: Path to directory of images
+        output_dir: Path to output directory
+
+    Returns:
+        pycolmap.Reconstruction or None
+    """
+    from hloc import (
+        extract_features,
+        match_features,
+        reconstruction,
+    )
+
+    # Paths for hloc outputs
+    sfm_dir = output_dir / "sfm"
+    sfm_dir.mkdir(parents=True, exist_ok=True)
+    features_path = output_dir / "features.h5"
+    matches_path = output_dir / "matches.h5"
+    pairs_path = output_dir / "pairs.txt"
+
+    # ── Generate exhaustive pairs ─────────────────────────────────────────
+    image_names = sorted([f.name for f in images_dir.glob("*.png")])
+    print(f"Generating exhaustive pairs for {len(image_names)} images...")
+    with open(pairs_path, "w") as f:
+        for i, name_i in enumerate(image_names):
+            for name_j in image_names[i + 1:]:
+                f.write(f"{name_i} {name_j}\n")
+
+    n_pairs = len(image_names) * (len(image_names) - 1) // 2
+    print(f"  {n_pairs} pairs")
+
+    # ── SuperPoint feature extraction ─────────────────────────────────────
+    print("\nExtracting SuperPoint features...")
+    feature_conf = extract_features.confs["superpoint_max"]
+    feature_conf["model"]["max_keypoints"] = 4096
+    extract_features.main(
+        conf=feature_conf,
+        image_dir=images_dir,
+        export_dir=output_dir,
+        feature_path=features_path,
+    )
+
+    # ── LightGlue matching ────────────────────────────────────────────────
+    print("Running LightGlue matching...")
+    match_conf = match_features.confs["superglue"]
+    match_features.main(
+        conf=match_conf,
+        pairs=pairs_path,
+        features=features_path,
+        export_dir=output_dir,
+        matches=matches_path,
+    )
+
+    # ── COLMAP reconstruction from hloc features ──────────────────────────
+    print("Running COLMAP incremental SfM from hloc features...")
+    model = reconstruction.main(
+        sfm_dir=sfm_dir,
+        image_dir=images_dir,
+        pairs=pairs_path,
+        features=features_path,
+        matches=matches_path,
+        camera_mode=pycolmap.CameraMode.SINGLE,
+        camera_model="SIMPLE_RADIAL",
+    )
+
+    return model
 
 
 def main():
@@ -28,7 +101,7 @@ def main():
 
     frame_str = f"{args.frame_idx:06d}"
 
-    # ── Collect composited images from all cameras ────────────────────────────
+    # ── Collect images from all cameras ────────────────────────────────────
     images_dir = output_dir / "images"
     if images_dir.exists():
         shutil.rmtree(images_dir)
@@ -42,90 +115,50 @@ def main():
     cam_names = []
 
     for cam_dir in cam_dirs:
-        # Use raw images (studio background provides texture for COLMAP matching)
         src = cam_dir / "images" / f"{frame_str}.png"
         if not src.exists():
             print(f"  WARNING: No image for {cam_dir.name} frame {frame_str}")
             continue
 
-        cam_name = cam_dir.name  # e.g. "cam_0"
+        cam_name = cam_dir.name
         dst = images_dir / f"{cam_name}.png"
         shutil.copy2(str(src), str(dst))
         cam_names.append(cam_name)
 
     print(f"Collected {len(cam_names)} camera images from frame {frame_str}")
 
-    # ── COLMAP: Feature extraction ────────────────────────────────────────────
-    db_path = output_dir / "database.db"
-    if db_path.exists():
-        db_path.unlink()
+    # ── Run hloc SfM ──────────────────────────────────────────────────────
+    recon = run_hloc_sfm(images_dir, output_dir)
 
-    print("\nExtracting SIFT features...")
-    opts = pycolmap.FeatureExtractionOptions()
-    opts.max_image_size = 2048  # 1080p is fine at this size
-    opts.sift.max_num_features = 16384
-    pycolmap.extract_features(
-        database_path=str(db_path),
-        image_path=str(images_dir),
-        camera_mode=pycolmap.CameraMode.SINGLE,  # all cameras share one model initially
-        camera_model="OPENCV",
-        extraction_options=opts,
-    )
-
-    # ── COLMAP: Exhaustive matching ───────────────────────────────────────────
-    print("Running exhaustive matching...")
-    pycolmap.match_exhaustive(database_path=str(db_path))
-
-    # ── COLMAP: Incremental SfM ───────────────────────────────────────────────
-    sparse_dir = output_dir / "sparse"
-    if sparse_dir.exists():
-        shutil.rmtree(sparse_dir)
-    sparse_dir.mkdir(parents=True)
-
-    print("Running incremental SfM...")
-    mapper_opts = pycolmap.IncrementalPipelineOptions()
-    mapper_opts.min_num_matches = 15
-    mapper_opts.ba_global_max_num_iterations = 50
-    reconstructions = pycolmap.incremental_mapping(
-        database_path=str(db_path),
-        image_path=str(images_dir),
-        output_path=str(sparse_dir),
-        options=mapper_opts,
-    )
-
-    if not reconstructions:
-        print("ERROR: COLMAP reconstruction failed!")
+    if recon is None:
+        print("ERROR: Reconstruction failed!")
         return
 
-    # Use the largest reconstruction
-    recon = max(reconstructions.values(), key=lambda r: r.num_reg_images())
     print(f"\nReconstruction: {recon.num_reg_images()} images registered, "
           f"{len(recon.points3D)} points")
 
     if recon.num_reg_images() < len(cam_names):
         print(f"  WARNING: Only {recon.num_reg_images()}/{len(cam_names)} cameras registered!")
 
-    # ── Extract calibration ───────────────────────────────────────────────────
+    # ── Extract calibration ───────────────────────────────────────────────
     n_cams = len(cam_names)
     w2c_all = np.zeros((n_cams, 4, 4), dtype=np.float64)
     c2w_all = np.zeros((n_cams, 4, 4), dtype=np.float64)
     K_all = np.zeros((n_cams, 3, 3), dtype=np.float64)
     registered = np.zeros(n_cams, dtype=bool)
 
-    # Build name → cam_idx mapping
     name_to_idx = {name: i for i, name in enumerate(cam_names)}
 
-    # Mean reprojection error
     reproj_errors = []
 
     for img_id, image in recon.images.items():
-        img_name = Path(image.name).stem  # "cam_0"
+        img_name = Path(image.name).stem
         if img_name not in name_to_idx:
             continue
         idx = name_to_idx[img_name]
 
-        # World-to-camera: R | t
-        cfw = image.cam_from_world()  # pycolmap 3.13: method, not property
+        # World-to-camera
+        cfw = image.cam_from_world()
         R = cfw.rotation.matrix()
         t = cfw.translation
         w2c = np.eye(4)
@@ -137,7 +170,7 @@ def main():
         # Intrinsics
         cam = recon.cameras[image.camera_id]
         params = cam.params
-        model_name = str(cam.model).split(".")[-1]  # e.g. "OPENCV" from "CameraModelId.OPENCV"
+        model_name = str(cam.model).split(".")[-1]
         if model_name in ("OPENCV", "PINHOLE"):
             fx, fy, cx, cy = params[0], params[1], params[2], params[3]
         elif model_name in ("SIMPLE_PINHOLE", "SIMPLE_RADIAL"):
@@ -150,7 +183,6 @@ def main():
         K_all[idx] = np.array([[fx, 0, cx], [0, fy, cy], [0, 0, 1]])
         registered[idx] = True
 
-        # Track reprojection error
         for p2d in image.points2D:
             if p2d.has_point3D() and p2d.point3D_id in recon.points3D:
                 reproj_errors.append(recon.points3D[p2d.point3D_id].error)
@@ -162,7 +194,7 @@ def main():
         mean_err = np.mean(reproj_errors)
         print(f"Mean reprojection error: {mean_err:.4f} px")
 
-    # ── Extract sparse 3D points ──────────────────────────────────────────────
+    # ── Extract sparse 3D points ──────────────────────────────────────────
     pts = []
     cols = []
     for pid, p in recon.points3D.items():
@@ -172,7 +204,7 @@ def main():
     points3d = np.array(pts, dtype=np.float32) if pts else np.zeros((0, 3), dtype=np.float32)
     colors3d = np.array(cols, dtype=np.float32) if cols else np.zeros((0, 3), dtype=np.float32)
 
-    # ── Save calibration ──────────────────────────────────────────────────────
+    # ── Save calibration ──────────────────────────────────────────────────
     calib_path = scene_dir / "calibration.npz"
     np.savez(
         str(calib_path),
@@ -187,7 +219,6 @@ def main():
     print(f"\nSaved calibration to {calib_path}")
     print(f"  {n_registered} cameras, {len(points3d)} sparse points")
 
-    # Print camera positions for sanity check
     positions = c2w_all[registered][:, :3, 3]
     if len(positions) > 0:
         center = positions.mean(axis=0)
