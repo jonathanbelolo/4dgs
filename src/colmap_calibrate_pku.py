@@ -87,7 +87,7 @@ def main():
     print("Running incremental SfM...")
     mapper_opts = pycolmap.IncrementalPipelineOptions()
     mapper_opts.min_num_matches = 15
-    mapper_opts.mapper.ba_global_max_num_iterations = 50
+    mapper_opts.ba_global_max_num_iterations = 50
     reconstructions = pycolmap.incremental_mapping(
         database_path=str(db_path),
         image_path=str(images_dir),
