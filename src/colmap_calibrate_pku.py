@@ -10,7 +10,6 @@ import argparse
 import shutil
 import numpy as np
 from pathlib import Path
-from scipy.spatial.transform import Rotation
 
 import pycolmap
 
@@ -36,12 +35,13 @@ def main():
     images_dir.mkdir(parents=True)
 
     per_view = scene_dir / "per_view"
-    cam_dirs = sorted(per_view.iterdir(), key=lambda d: int(d.name.split("_")[1]))
+    cam_dirs = sorted(
+        [d for d in per_view.iterdir() if d.is_dir() and d.name.startswith("cam_")],
+        key=lambda d: int(d.name.split("_")[1])
+    )
     cam_names = []
 
     for cam_dir in cam_dirs:
-        if not cam_dir.is_dir() or not cam_dir.name.startswith("cam_"):
-            continue
         # Use composited images (white bg) for better COLMAP features
         src = cam_dir / "com" / f"{frame_str}.png"
         if not src.exists():

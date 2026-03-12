@@ -176,6 +176,10 @@ def main():
     cam_center = cam_positions.mean(axis=0)
     forward_init = person_center - cam_center
     forward_init = forward_init - np.dot(forward_init, up) * up
+    if np.linalg.norm(forward_init) < 1e-6:
+        # Person is at ring center — use direction to first camera instead
+        forward_init = cam_positions[0] - cam_center
+        forward_init = forward_init - np.dot(forward_init, up) * up
     forward = forward_init / np.linalg.norm(forward_init)
 
     # Right = up × forward

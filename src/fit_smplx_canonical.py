@@ -61,7 +61,7 @@ def project_points(points_3d, K, w2c):
     t = w2c[:3, 3]
     pts_cam = (R @ points_3d.T + t[:, None]).T  # (N, 3)
     pts_2d = (K @ pts_cam.T).T  # (N, 3)
-    return pts_2d[:, :2] / pts_2d[:, 2:3].clamp(min=1e-6)
+    return pts_2d[:, :2] / np.clip(pts_2d[:, 2:3], 1e-6, None)
 
 
 def project_bbox_to_camera(origin, axes, half_extents, K, w2c, H, W):
@@ -501,7 +501,8 @@ def render_silhouette_differentiable(vertices, faces, K, w2c, H, W, device="cuda
 
 
 def optimize_smplx_multiview(smplx_model, init_params, calib, scene_dir,
-                              frame_idx, canonical, device="cuda"):
+                              frame_idx, canonical, device="cuda",
+                              n_iters=OPT_ITERS_STAGE_B):
     """Stage B: Multi-view SMPL-X joint optimization for a single frame.
 
     Args:
@@ -512,6 +513,7 @@ def optimize_smplx_multiview(smplx_model, init_params, calib, scene_dir,
         frame_idx: int frame index
         canonical: canonical frame dict
         device: torch device
+        n_iters: number of optimization iterations
 
     Returns:
         dict with optimized SMPL-X params + vertices + joints
@@ -575,7 +577,7 @@ def optimize_smplx_multiview(smplx_model, init_params, calib, scene_dir,
     faces = smplx_model.faces.astype(np.int64)
 
     # Optimization loop
-    for it in range(OPT_ITERS_STAGE_B):
+    for it in range(n_iters):
         optimizer.zero_grad()
 
         # Forward pass: SMPL-X
@@ -618,28 +620,27 @@ def optimize_smplx_multiview(smplx_model, init_params, calib, scene_dir,
             loss_mask = loss_mask + bce.mean()
             n_mask += 1
 
-            # Joint reprojection loss (project SMPL-X joints to 2D)
-            joints_np = joints[0].detach().cpu().numpy()
-            joints_2d = project_points(joints_np, K_all[cam_idx], w2c[cam_idx])
-            # Only penalize joints that fall within the foreground mask
-            joints_2d_t = torch.tensor(joints_2d, dtype=torch.float32, device=device)
-            jx = joints_2d_t[:, 0].long().clamp(0, img_W - 1)
-            jy = joints_2d_t[:, 1].long().clamp(0, img_H - 1)
-            visible = gt_mask[jy, jx] > 0.5
-            if visible.sum() > 5:
-                # Re-project with gradients
-                verts_cam = (torch.tensor(w2c[cam_idx][:3, :3], dtype=torch.float32, device=device) @
-                             joints[0].T +
-                             torch.tensor(w2c[cam_idx][:3, 3], dtype=torch.float32, device=device).unsqueeze(1))
-                verts_cam = verts_cam.T  # (J, 3)
-                K_t = torch.tensor(K_all[cam_idx], dtype=torch.float32, device=device)
-                proj = (K_t @ verts_cam.T).T
-                proj_2d = proj[:, :2] / proj[:, 2:3].clamp(min=0.01)
-                # Simple reprojection: penalize joints outside foreground
-                loss_reproj = loss_reproj + F.mse_loss(
-                    proj_2d[visible] / torch.tensor([img_W, img_H], dtype=torch.float32, device=device),
-                    joints_2d_t[visible] / torch.tensor([img_W, img_H], dtype=torch.float32, device=device),
-                )
+            # Joint-in-mask loss: penalize joints that project outside foreground
+            # Project joints differentiably to 2D
+            R_t = torch.tensor(w2c[cam_idx][:3, :3], dtype=torch.float32, device=device)
+            t_t = torch.tensor(w2c[cam_idx][:3, 3], dtype=torch.float32, device=device)
+            K_t = torch.tensor(K_all[cam_idx], dtype=torch.float32, device=device)
+            joints_cam = (R_t @ joints[0].T + t_t.unsqueeze(1)).T  # (J, 3)
+            proj = (K_t @ joints_cam.T).T
+            proj_2d = proj[:, :2] / proj[:, 2:3].clamp(min=0.01)
+
+            # Sample mask value at projected joint locations (differentiable via grid_sample)
+            # Normalize to [-1, 1] for grid_sample
+            proj_norm_x = proj_2d[:, 0] / img_W * 2 - 1
+            proj_norm_y = proj_2d[:, 1] / img_H * 2 - 1
+            grid = torch.stack([proj_norm_x, proj_norm_y], dim=-1).unsqueeze(0).unsqueeze(0)  # (1, 1, J, 2)
+            mask_input = gt_mask.unsqueeze(0).unsqueeze(0)  # (1, 1, H, W)
+            sampled = F.grid_sample(mask_input, grid, align_corners=True, mode="bilinear")  # (1, 1, 1, J)
+            mask_at_joints = sampled.squeeze()  # (J,)
+            # Penalize joints outside mask (mask_at_joints should be 1.0 for visible joints)
+            in_frame = (joints_cam[:, 2] > 0.01)
+            if in_frame.sum() > 5:
+                loss_reproj = loss_reproj + (1 - mask_at_joints[in_frame]).mean()
 
         if n_mask > 0:
             loss_mask = loss_mask / n_mask
@@ -812,7 +813,6 @@ def main():
     # Shared betas across all frames (initialized from HMR2.0, refined in first few frames)
     shared_betas = init_params["betas"].copy()
     prev_params = None
-    prev_prev_params = None
 
     # ── Process each frame ────────────────────────────────────────────────────
     for f_count, f_idx in enumerate(frame_indices):
@@ -847,7 +847,8 @@ def main():
         # ── Stage B: Multi-view optimization ──────────────────────────────────
         print(f"  Stage B: Multi-view optimization ({args.opt_iters} iters)...")
         result = optimize_smplx_multiview(
-            smplx_model, frame_init, calib, scene_dir, f_idx, canonical, device
+            smplx_model, frame_init, calib, scene_dir, f_idx, canonical, device,
+            n_iters=args.opt_iters,
         )
 
         if result is None:
@@ -884,8 +885,7 @@ def main():
             semantic_labels=semantic_labels,
         )
 
-        # Update temporal tracking
-        prev_prev_params = prev_params
+        # Update temporal tracking (previous frame init for next frame)
         prev_params = result
 
     print(f"\nDone. Saved SMPL-X params to {out_dir}/")
