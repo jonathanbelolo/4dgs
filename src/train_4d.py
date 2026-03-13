@@ -137,9 +137,10 @@ def load_scene_4d(scene_dir: str, frames_base: str = "frames",
 class FrameCache:
     """Batch-swap cache: loads a batch of frames onto GPU, swaps periodically."""
 
-    def __init__(self, max_size: int = 50, swap_every: int = 1000):
+    def __init__(self, max_size: int = 50, swap_every: int = 1000, downsample: int = 1):
         self.max_size = max_size
         self.swap_every = swap_every
+        self.downsample = downsample
         self.cache = {}  # frame_idx -> (C, H, W, 3) tensor on GPU
         self.loaded_indices = []
 
@@ -156,7 +157,16 @@ class FrameCache:
             for idx in indices:
                 images = []
                 for path in frame_paths[idx]:
-                    img = np.array(Image.open(path)).astype(np.float32) / 255.0
+                    img = Image.open(path)
+                    if self.downsample > 1:
+                        w, h = img.size
+                        img = img.resize((w // self.downsample, h // self.downsample),
+                                         Image.BILINEAR)
+                    img = np.array(img).astype(np.float32) / 255.0
+                    if img.ndim == 2:
+                        img = np.stack([img] * 3, axis=-1)
+                    elif img.shape[2] == 4:
+                        img = img[:, :, :3]
                     images.append(img)
                 self.cache[idx] = torch.tensor(np.stack(images), device=device)
             self.loaded_indices = indices
@@ -839,7 +849,8 @@ def train_4d(args):
 
     # Frame cache with batch swapping
     cache = FrameCache(max_size=args.frame_cache_size,
-                       swap_every=args.cache_swap_every)
+                       swap_every=args.cache_swap_every,
+                       downsample=args.downsample)
 
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
