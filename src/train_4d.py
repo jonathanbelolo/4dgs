@@ -771,12 +771,24 @@ def train_4d(args):
 
     # Load scene metadata (lazy — images loaded on demand)
     print("Loading 4D scene metadata...")
-    (frame_paths, cam_names, camtoworlds, K, timestamps,
-     near, far, H, W) = load_scene_4d(
-        args.scene_dir, frames_base=args.frames_base,
-        downsample=args.downsample, num_frames=args.num_frames,
-        frame_stride=args.frame_stride, device=device,
-    )
+    mask_paths = None
+    if args.data_format == "pku_v2":
+        import sys
+        sys.path.insert(0, str(Path(__file__).parent))
+        from data_pku_v2 import load_scene_4d_pku_v2
+        (frame_paths, mask_paths, cam_names, camtoworlds, K, timestamps,
+         near, far, H, W) = load_scene_4d_pku_v2(
+            args.scene_dir, num_frames=args.num_frames,
+            frame_stride=args.frame_stride, downsample=args.downsample,
+            device=device,
+        )
+    else:
+        (frame_paths, cam_names, camtoworlds, K, timestamps,
+         near, far, H, W) = load_scene_4d(
+            args.scene_dir, frames_base=args.frames_base,
+            downsample=args.downsample, num_frames=args.num_frames,
+            frame_stride=args.frame_stride, device=device,
+        )
     T = len(timestamps)
     C = len(cam_names)
 
@@ -785,6 +797,16 @@ def train_4d(args):
 
     if args.init_ply:
         model.init_from_static_ply(args.init_ply)
+    elif args.body_init:
+        # Initialize from SMPL-X surface points
+        body_init_path = Path(args.scene_dir) / "smplx_init.npz"
+        if not body_init_path.exists():
+            raise FileNotFoundError(f"Body init not found: {body_init_path}")
+        body_data = np.load(str(body_init_path))
+        points = torch.tensor(body_data["positions"], dtype=torch.float32, device=device)
+        colors = torch.tensor(body_data["colors"], dtype=torch.float32, device=device)
+        print(f"Initialized {len(points)} Gaussians from SMPL-X body init")
+        model.init_from_points(points, colors)
     else:
         # Cold start from SfM points (recommended)
         sfm_dir = Path(args.scene_dir) / "colmap"
@@ -985,9 +1007,14 @@ if __name__ == "__main__":
                         help="Number of frames to keep on GPU at once")
     parser.add_argument("--cache_swap_every", type=int, default=1000,
                         help="Swap frame batch every N steps")
+    parser.add_argument("--data_format", type=str, default="llff",
+                        choices=["llff", "pku_v2"],
+                        help="Data format: llff (default) or pku_v2 (per_view)")
     # Init
     parser.add_argument("--init_ply", type=str, default=None,
                         help="Optional: warm-start from trained static PLY")
+    parser.add_argument("--body_init", action="store_true",
+                        help="Initialize from smplx_init.npz (SMPL-X surface points)")
     parser.add_argument("--sfm_dir", type=str, default=None)
     parser.add_argument("--num_points", type=int, default=200_000)
     # Training
